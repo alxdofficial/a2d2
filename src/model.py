@@ -3,11 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 # Define the input and output dimensions for internal modules
 INTERNAL_DIM = 4096
-FINAL_OUTPUT_DIM = 5
-SUB_NETWORK_DIM = 64
-NUM_SUB_NETWORKS = INTERNAL_DIM // SUB_NETWORK_DIM
+FINAL_OUTPUT_DIM = 9
+NUM_SUB_NETWORKS = 16
 NUM_LAYERS = 12
-NUM_HEADS = 1
 
 class FeatureExtractor(nn.Module):
     def __init__(self, input_channels=3, num_layers=5, kernel_size=5, stride=3, dropout=0.3):
@@ -79,93 +77,114 @@ class VisionEncoder(nn.Module):
         peripheral_output = self.peripheral_fc(peripheral_features)
 
         return fovea_output, peripheral_output 
+    
 
-class MemoryModule(nn.Module):
-    def __init__(self, memory_size):
-        super(MemoryModule, self).__init__()
-        self.memory_size = memory_size
-        self.memory_weights = nn.ParameterList([nn.Parameter(torch.randn(SUB_NETWORK_DIM, SUB_NETWORK_DIM)) for _ in range(memory_size)])
-        self.layer_norms = nn.ModuleList([nn.LayerNorm(SUB_NETWORK_DIM) for _ in range(memory_size)])
 
-    def forward(self, x):
+class HebbianLayer(nn.Module):
+    def __init__(self, input_size, output_size, scaling, decay):
+        super(HebbianLayer, self).__init__()
+        self.weight = nn.Parameter(torch.randn(output_size, input_size))
+        self.recurrent_weight = nn.Parameter(torch.randn(output_size, output_size))
+        self.alpha = scaling  # Scaling parameter for Hebbian learning
+        self.decay = decay  # Decay parameter
+
+    def forward(self, x, prev_state):
+        combined_input = x + torch.mm(prev_state.detach(), self.recurrent_weight.detach())
+        activations = F.relu(torch.mm(combined_input, self.weight.detach().t()))
+        return activations, activations
+
+    def hebbian_update(self, activations, x, prev_state, dopamine_signal):
         with torch.no_grad():
-            for weight, layer_norm in zip(self.memory_weights, self.layer_norms):
-                x = torch.relu(x @ weight.T)  # Apply ReLU activation
-                x = layer_norm(x)  # Apply Layer Normalization
-        return x  # Shape: (batch_size, SUB_NETWORK_DIM)
+            # Hebbian update for input weights
+            hebbian_term_input = torch.mm(activations.t(), x)
+            self.weight += self.alpha * dopamine_signal * hebbian_term_input
 
-class AttentionMechanism(nn.Module):
-    def __init__(self, num_heads):
-        super(AttentionMechanism, self).__init__()
-        self.query_projection = nn.Linear(SUB_NETWORK_DIM, SUB_NETWORK_DIM)
-        self.key_projection = nn.Linear(SUB_NETWORK_DIM, SUB_NETWORK_DIM)
-        self.value_projection = nn.Linear(SUB_NETWORK_DIM, SUB_NETWORK_DIM)
-        self.attention = nn.MultiheadAttention(SUB_NETWORK_DIM, num_heads)
+            # Hebbian update for recurrent weights
+            hebbian_term_recurrent = torch.mm(activations.t(), prev_state)
+            self.recurrent_weight += self.alpha * dopamine_signal * hebbian_term_recurrent
 
-    def forward(self, queries, keys, values):
-        # Project queries, keys, and values
-        queries = self.query_projection(queries)
-        keys = self.key_projection(keys)
-        values = self.value_projection(values)
-        
-        # queries, keys, values: (seq_len, batch_size, SUB_NETWORK_DIM)
-        attn_output, attn_weights = self.attention(queries, keys, values)
-        return attn_output, attn_weights
+            # Apply decay to input weights
+            self.weight -= self.decay * (self.weight * (activations.sum(dim=0, keepdim=True) == 0).float().t())
 
+            # Apply decay to recurrent weights
+            self.recurrent_weight -= self.decay * (self.recurrent_weight * (activations.sum(dim=0, keepdim=True) == 0).float().t())
+
+class SubNetwork(nn.Module):
+    def __init__(self, input_size, output_size, num_layers):
+        super(SubNetwork, self).__init__()
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            scaling = torch.FloatTensor(1).uniform_(0.1, 1).item()
+            decay = torch.FloatTensor(1).uniform_(0.01, 0.2).item()
+            self.layers.append(HebbianLayer(input_size, output_size, scaling, decay))
+
+    def forward(self, x, prev_state):
+        hidden_states = []
+        new_state = prev_state
+        for layer in self.layers:
+            hidden_state, new_state = layer(x, new_state)
+            hidden_states.append(hidden_state)
+        return hidden_states, new_state
+
+    def hebbian_update(self, hidden_states, x, prev_state, dopamine_signal):
+        for i, layer in enumerate(self.layers):
+            layer.hebbian_update(hidden_states[i], x, prev_state, dopamine_signal)
+
+class DopamineNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, num_subnetworks):
+        super(DopamineNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, num_subnetworks)
+
+    def forward(self, prev_loss, current_loss, activations):
+        loss_diff = prev_loss - current_loss
+        x = torch.cat([loss_diff.unsqueeze(0), activations.flatten().unsqueeze(0)], dim=-1)
+        x = F.relu(self.fc1(x))
+        dopamine_signals = torch.tanh(self.fc2(x))  # Output in range [-1, 1]
+        return dopamine_signals
+    
 class NeuralMemoryNetwork(nn.Module):
-    def __init__(self, memory_size, num_heads):
+    def __init__(self, input_size, hidden_size, output_size, num_subnetworks, num_layers, dopamine_hidden_size):
         super(NeuralMemoryNetwork, self).__init__()
-        self.memory_module = MemoryModule(memory_size)
-        self.attention_mechanism = AttentionMechanism(num_heads)
+        self.subnetworks = nn.ModuleList()
+        self.hidden_size = hidden_size
+        self.num_subnetworks = num_subnetworks
+        for _ in range(num_subnetworks):
+            self.subnetworks.append(SubNetwork(input_size, hidden_size, num_layers))
 
-    def forward(self, x):
-        with torch.no_grad():
-            memory_outputs = self.memory_module(x)  # Shape: (batch_size, SUB_NETWORK_DIM)
-        memory_outputs = memory_outputs.unsqueeze(1)  # Shape: (batch_size, 1, SUB_NETWORK_DIM)
+        self.output_layer = nn.Linear(hidden_size * num_subnetworks, output_size)
+        self.dopamine_network = DopamineNetwork(hidden_size * num_subnetworks + 1, dopamine_hidden_size, num_subnetworks)
+        self.prev_loss = None
+
+    def forward(self, x, prev_states):
+        x_splits = x.split(self.hidden_size, dim=-1)
+        all_hidden_states = []
+        new_states = []
+        activations = []
+        for i, subnetwork in enumerate(self.subnetworks):
+            hidden_states, new_state = subnetwork(x_splits[i], prev_states[i])
+            all_hidden_states.append(hidden_states)
+            new_states.append(new_state)
+            activations.append(hidden_states[-1])
+
+        combined_activations = torch.cat(activations, dim=-1)
+        combined_output = torch.cat([hs[-1] for hs in all_hidden_states], dim=-1)
+        final_output = self.output_layer(combined_output)
+        return final_output, new_states, all_hidden_states, combined_activations
+
+    def hebbian_update(self, all_hidden_states, x, prev_states, current_loss, combined_activations):
+        if self.prev_loss is None:
+            self.prev_loss = current_loss
+
+        dopamine_signals = self.dopamine_network(self.prev_loss, current_loss, combined_activations)
+
+        for i, subnetwork in enumerate(self.subnetworks):
+            subnetwork.hebbian_update(all_hidden_states[i], x.split(self.hidden_size, dim=-1)[i], prev_states[i], dopamine_signals[0, i])
+
+        self.prev_loss = current_loss
+
+
         
-        # Step 1: Calculate the average of the weights for each neuron in layer L
-        avg_weights = torch.stack([weight.mean(dim=1) for weight in self.memory_module.memory_weights], dim=0)
-        # avg_weights: Shape (memory_size, SUB_NETWORK_DIM)
-        avg_weights = avg_weights.unsqueeze(0)  # Shape: (1, memory_size, SUB_NETWORK_DIM)
-        
-        # Step 2: Compute the attention between the memory output and avg_weights
-        attn_output, attn_weights = self.attention_mechanism(avg_weights, memory_outputs, memory_outputs)
-        
-        # Step 3: Apply the weight change proportionally
-        attn_output = attn_output.squeeze(0)  # Shape: (memory_size, SUB_NETWORK_DIM)
-        
-        for i, weight in enumerate(self.memory_module.memory_weights):
-            avg_weight_per_neuron = weight.mean(dim=1)  # Shape: (SUB_NETWORK_DIM)
-            delta = attn_output[i]  # Shape: (SUB_NETWORK_DIM)
-            
-            # Calculate the proportional change for each weight
-            weight_update = (weight.T * delta / avg_weight_per_neuron).T  # Shape: (SUB_NETWORK_DIM, SUB_NETWORK_DIM)
-            weight.data += weight_update.data
-
-        # Step 5: Use the memory output as the final output
-        output = memory_outputs.squeeze(1)  # Shape: (batch_size, SUB_NETWORK_DIM)
-        
-        return output
-
-class MasterNeuralMemoryNetwork(nn.Module):
-    def __init__(self, num_heads):
-        super(MasterNeuralMemoryNetwork, self).__init__()
-        assert INTERNAL_DIM == SUB_NETWORK_DIM * NUM_SUB_NETWORKS, "INTERNAL_DIM must be equal to SUB_NETWORK_DIM * NUM_SUB_NETWORKS"
-        self.sub_memory_networks = nn.ModuleList([NeuralMemoryNetwork(NUM_LAYERS, num_heads) for _ in range(NUM_SUB_NETWORKS)])
-
-    def forward(self, x):
-        # Split the input into smaller vectors of shape (batch_size, SUB_NETWORK_DIM)
-        sub_inputs = x.split(SUB_NETWORK_DIM, dim=1)  # List of (batch_size, SUB_NETWORK_DIM)
-
-        # Process all sub-inputs through corresponding NeuralMemoryNetwork
-        sub_outputs = [self.sub_memory_networks[i](sub_inputs[i]) for i in range(NUM_SUB_NETWORKS)]
-        
-        # Combine the outputs back into one vector of shape (batch_size, INTERNAL_DIM)
-        combined_output = torch.cat(sub_outputs, dim=1)  # Shape: (batch_size, INTERNAL_DIM)
-
-        return combined_output
-
-
 class ActionDecoder(nn.Module):
     def __init__(self, internal_dim, final_output_dim):
         super(ActionDecoder, self).__init__()
@@ -201,3 +220,72 @@ class ActionDecoder(nn.Module):
         x = self.reduction_layers(x)  # Shape: (batch_size, final_output_dim)
         
         return x
+
+
+
+class NumericFeatureAdaptor(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(NumericFeatureAdaptor, self).__init__()
+        self.fc = nn.Linear(input_size, output_size)
+
+    def forward(self, x):
+        return F.relu(self.fc(x))
+
+
+
+class Brain(nn.Module):
+    def __init__(self, internal_dim, final_output_dim, sub_network_dim, num_layers, dopamine_hidden_size):
+        super(Brain, self).__init__()
+        
+        self.internal_dim = internal_dim
+        self.final_output_dim = final_output_dim
+        
+        # Vision encoders
+        self.vision_encoder_1 = VisionEncoder()
+        self.vision_encoder_2 = VisionEncoder()
+        self.vision_encoder_3 = VisionEncoder()
+        
+        # Numeric feature adaptor
+        self.numeric_feature_adaptor = NumericFeatureAdaptor(input_size=3, output_size=internal_dim)
+        
+        # Neural memory network
+        self.neural_memory = NeuralMemoryNetwork(input_size=internal_dim, 
+                                                 hidden_size=sub_network_dim, 
+                                                 output_size=internal_dim, 
+                                                 num_subnetworks=internal_dim // sub_network_dim, 
+                                                 num_layers=num_layers, 
+                                                 dopamine_hidden_size=dopamine_hidden_size)
+        
+        # Action decoder
+        self.action_decoder = ActionDecoder(internal_dim=internal_dim, final_output_dim=final_output_dim)
+        
+        # Initialize previous states for the neural memory network
+        self.prev_states = [torch.zeros(1, sub_network_dim) for _ in range(internal_dim // sub_network_dim)]
+
+    def forward(self, image_1, image_2, image_3, accel_data, fovea_coords):
+        fovea_x1, fovea_y1, fovea_x2, fovea_y2, fovea_x3, fovea_y3 = fovea_coords
+        
+        # Process images through their respective vision encoders
+        fovea_output_1, peripheral_output_1 = self.vision_encoder_1(image_1, fovea_x1, fovea_y1)
+        fovea_output_2, peripheral_output_2 = self.vision_encoder_2(image_2, fovea_x2, fovea_y2)
+        fovea_output_3, peripheral_output_3 = self.vision_encoder_3(image_3, fovea_x3, fovea_y3)
+        
+        # Process accelerometer data through the numeric feature adaptor
+        accel_output = self.numeric_feature_adaptor(accel_data)
+        
+        # Combine encodings using max pooling
+        combined_encoding = torch.max(torch.stack([fovea_output_1, peripheral_output_1, 
+                                                   fovea_output_2, peripheral_output_2, 
+                                                   fovea_output_3, peripheral_output_3, 
+                                                   accel_output]), dim=0)[0]
+        
+        # Pass combined encoding through the neural memory network
+        memory_output, new_states, all_hidden_states, combined_activations = self.neural_memory(combined_encoding.unsqueeze(0), self.prev_states)
+        
+        # Update previous states for the next forward pass
+        self.prev_states = new_states
+        
+        # Pass the output of the neural memory network through the action decoder
+        final_output = self.action_decoder(memory_output.squeeze(0))
+        
+        return final_output
