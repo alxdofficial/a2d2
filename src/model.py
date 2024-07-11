@@ -285,7 +285,10 @@ class Brain(nn.Module):
         # Update previous states for the next forward pass
         self.prev_states = new_states
         
+        # Add skip connection from the combined encoding to the memory output
+        combined_output = combined_encoding + memory_output.squeeze(0)
+        
         # Pass the output of the neural memory network through the action decoder
-        final_output = self.action_decoder(memory_output.squeeze(0))
+        final_output = self.action_decoder(combined_output)
         
         return final_output
