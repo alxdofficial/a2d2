@@ -1,12 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 # Define the input and output dimensions for internal modules
 INTERNAL_DIM = 4096
 FINAL_OUTPUT_DIM = 9
-NUM_SUB_NETWORKS = 16
-NUM_LAYERS = 12
+NUM_SUB_NETWORKS = 8
+NUM_LAYERS = 5
+NUM_MEMORY_NETWORKS = 24
+DOPAMINE_HIDDEN_SIZE = 128
 
+# 1. Feature Extractor
+# The FeatureExtractor class consists of convolutional layers with batch normalization, ReLU activation, and dropout for feature extraction from images.
 class FeatureExtractor(nn.Module):
     def __init__(self, input_channels=3, num_layers=5, kernel_size=5, stride=3, dropout=0.3):
         super(FeatureExtractor, self).__init__()
@@ -14,7 +19,8 @@ class FeatureExtractor(nn.Module):
         layers = []
         for i in range(num_layers):
             layers.append(nn.Conv2d(input_channels, channels[i], kernel_size=kernel_size, stride=stride))
-            layers.append(nn.BatchNorm2d(channels[i]))
+            if i != num_layers - 1:
+                layers.append(nn.BatchNorm2d(channels[i]))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             input_channels = channels[i]
@@ -22,7 +28,8 @@ class FeatureExtractor(nn.Module):
 
     def forward(self, x):
         return self.extractor(x)
-
+# 2. Fully Connected Layer
+# The FullyConnected class creates a fully connected network with ReLU activation and dropout.
 class FullyConnected(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.3):
         super(FullyConnected, self).__init__()
@@ -38,11 +45,13 @@ class FullyConnected(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
-    
+# 3. Vision Encoder
+# The VisionEncoder class uses the FeatureExtractor and FullyConnected layers to process images and generate feature vectors.    
 class VisionEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, img_width, img_height):
         super(VisionEncoder, self).__init__()
-        
+        self.img_width = img_width
+        self.img_height = img_height
         # Feature extractors
         self.fovea_feature_extractor = FeatureExtractor()
         self.peripheral_feature_extractor = FeatureExtractor()
@@ -59,8 +68,8 @@ class VisionEncoder(nn.Module):
         # Crop the fovea image
         crop_size = 512
         half_crop = crop_size // 2
-        x = min(max(x, half_crop), 1920 - half_crop)
-        y = min(max(y, half_crop), 1920 - half_crop)
+        x = min(max(x, half_crop), self.img_width - half_crop)
+        y = min(max(y, half_crop), self.img_height - half_crop)
         fovea_image = image[:, :, y - half_crop:y + half_crop, x - half_crop:x + half_crop]
 
         # Resize the entire image
@@ -77,9 +86,9 @@ class VisionEncoder(nn.Module):
         peripheral_output = self.peripheral_fc(peripheral_features)
 
         return fovea_output, peripheral_output 
-    
 
-
+# 4. Hebbian Layer
+# The HebbianLayer class defines a layer with Hebbian learning, where weights are updated based on the activity of neurons and the presence of a dopamine signal.    
 class HebbianLayer(nn.Module):
     def __init__(self, input_size, output_size, scaling, decay):
         super(HebbianLayer, self).__init__()
@@ -87,104 +96,109 @@ class HebbianLayer(nn.Module):
         self.recurrent_weight = nn.Parameter(torch.randn(output_size, output_size))
         self.alpha = scaling  # Scaling parameter for Hebbian learning
         self.decay = decay  # Decay parameter
+        self.prev_state = None
+        self.prev_input = None
 
-    def forward(self, x, prev_state):
-        combined_input = x + torch.mm(prev_state.detach(), self.recurrent_weight.detach())
+    def forward(self, x):
+        if self.prev_state is None:
+            self.prev_state = torch.zeros(x.size(0), self.weight.size(0), device=x.device)
+        combined_input = x + torch.mm(self.prev_state.detach(), self.recurrent_weight.detach())
         activations = F.relu(torch.mm(combined_input, self.weight.detach().t()))
-        return activations, activations
+        self.prev_input = x
+        self.prev_state = activations
+        return activations
 
-    def hebbian_update(self, activations, x, prev_state, dopamine_signal):
+    def hebbian_update(self, dopamine_signal):
         with torch.no_grad():
             # Hebbian update for input weights
-            hebbian_term_input = torch.mm(activations.t(), x)
+            hebbian_term_input = torch.mm(self.prev_state.t(), self.prev_input)
             self.weight += self.alpha * dopamine_signal * hebbian_term_input
 
             # Hebbian update for recurrent weights
-            hebbian_term_recurrent = torch.mm(activations.t(), prev_state)
+            hebbian_term_recurrent = torch.mm(self.prev_state.t(), self.prev_state)
             self.recurrent_weight += self.alpha * dopamine_signal * hebbian_term_recurrent
 
-            # Apply decay to input weights
-            self.weight -= self.decay * (self.weight * (activations.sum(dim=0, keepdim=True) == 0).float().t())
+            # Apply decay to all input weights
+            self.weight -= self.decay * self.weight
 
-            # Apply decay to recurrent weights
-            self.recurrent_weight -= self.decay * (self.recurrent_weight * (activations.sum(dim=0, keepdim=True) == 0).float().t())
-
+            # Apply decay to all recurrent weights
+            self.recurrent_weight -= self.decay * self.recurrent_weight
+# 5. SubNetwork
+# The SubNetwork class stacks multiple HebbianLayers to create a more complex subnetwork.
 class SubNetwork(nn.Module):
     def __init__(self, input_size, output_size, num_layers):
         super(SubNetwork, self).__init__()
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             scaling = torch.FloatTensor(1).uniform_(0.1, 1).item()
-            decay = torch.FloatTensor(1).uniform_(0.01, 0.2).item()
+            decay = torch.FloatTensor(1).uniform_(0.01, 0.1).item()
             self.layers.append(HebbianLayer(input_size, output_size, scaling, decay))
+            input_size = output_size  # Update input size for the next layer
 
-    def forward(self, x, prev_state):
-        hidden_states = []
-        new_state = prev_state
+    def forward(self, x):
         for layer in self.layers:
-            hidden_state, new_state = layer(x, new_state)
-            hidden_states.append(hidden_state)
-        return hidden_states, new_state
+            x = layer(x)
+        return x
 
-    def hebbian_update(self, hidden_states, x, prev_state, dopamine_signal):
+    def hebbian_update(self, dopamine_signals):
         for i, layer in enumerate(self.layers):
-            layer.hebbian_update(hidden_states[i], x, prev_state, dopamine_signal)
-
+            layer.hebbian_update(dopamine_signals[i])
+# 6. Dopamine Network
+# The DopamineNetwork class generates dopamine signals based on the difference between previous and current losses and the activations from the networks.
 class DopamineNetwork(nn.Module):
-    def __init__(self, input_size, hidden_size, num_subnetworks):
+    def __init__(self, input_size, hidden_size, num_subnetworks, num_layers):
         super(DopamineNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, num_subnetworks)
+        self.fc2 = nn.Linear(hidden_size, num_subnetworks * num_layers)
+        self.num_layers = num_layers
 
     def forward(self, prev_loss, current_loss, activations):
         loss_diff = prev_loss - current_loss
         x = torch.cat([loss_diff.unsqueeze(0), activations.flatten().unsqueeze(0)], dim=-1)
         x = F.relu(self.fc1(x))
         dopamine_signals = torch.tanh(self.fc2(x))  # Output in range [-1, 1]
-        return dopamine_signals
-    
+        return dopamine_signals.view(-1, self.num_layers)  # Shape: (num_subnetworks, num_layers)
+# 7. Neural Memory Network
+# The NeuralMemoryNetwork class combines multiple subnetworks and a dopamine network to form a memory network that can update its weights based on a dopamine signal.    
 class NeuralMemoryNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_subnetworks, num_layers, dopamine_hidden_size):
         super(NeuralMemoryNetwork, self).__init__()
         self.subnetworks = nn.ModuleList()
         self.hidden_size = hidden_size
         self.num_subnetworks = num_subnetworks
+        self.num_layers = num_layers
         for _ in range(num_subnetworks):
-            self.subnetworks.append(SubNetwork(input_size, hidden_size, num_layers))
+            self.subnetworks.append(SubNetwork(hidden_size, hidden_size, num_layers))
 
         self.output_layer = nn.Linear(hidden_size * num_subnetworks, output_size)
-        self.dopamine_network = DopamineNetwork(hidden_size * num_subnetworks + 1, dopamine_hidden_size, num_subnetworks)
+        self.dopamine_network = DopamineNetwork(hidden_size * num_subnetworks + 1, dopamine_hidden_size, num_subnetworks, num_layers)
         self.prev_loss = None
 
-    def forward(self, x, prev_states):
+    def forward(self, x):
         x_splits = x.split(self.hidden_size, dim=-1)
-        all_hidden_states = []
-        new_states = []
-        activations = []
+        activations_of_all_subnetworks = []
         for i, subnetwork in enumerate(self.subnetworks):
-            hidden_states, new_state = subnetwork(x_splits[i], prev_states[i])
-            all_hidden_states.append(hidden_states)
-            new_states.append(new_state)
-            activations.append(hidden_states[-1])
+            activations_of_all_subnetworks.append(subnetwork(x_splits[i]))
 
-        combined_activations = torch.cat(activations, dim=-1)
-        combined_output = torch.cat([hs[-1] for hs in all_hidden_states], dim=-1)
-        final_output = self.output_layer(combined_output)
-        return final_output, new_states, all_hidden_states, combined_activations
+        # Combine final activations for the final output
+        combined_activations = torch.cat(activations_of_all_subnetworks, dim=-1)
 
-    def hebbian_update(self, all_hidden_states, x, prev_states, current_loss, combined_activations):
+        # Use combined activations to generate the final output
+        final_output = self.output_layer(combined_activations)
+        return final_output
+
+    def hebbian_update(self, current_loss, final_output):
         if self.prev_loss is None:
             self.prev_loss = current_loss
 
-        dopamine_signals = self.dopamine_network(self.prev_loss, current_loss, combined_activations)
+        dopamine_signals = self.dopamine_network(self.prev_loss, current_loss, final_output)
 
-        for i, subnetwork in enumerate(self.subnetworks):
-            subnetwork.hebbian_update(all_hidden_states[i], x.split(self.hidden_size, dim=-1)[i], prev_states[i], dopamine_signals[0, i])
+        for subnetwork in self.subnetworks:
+            subnetwork.hebbian_update(dopamine_signals)
 
         self.prev_loss = current_loss
-
-
-        
+# 8. Action Decoder
+# The ActionDecoder class reduces the internal representation to the final output using a series of fully connected layers.
 class ActionDecoder(nn.Module):
     def __init__(self, internal_dim, final_output_dim):
         super(ActionDecoder, self).__init__()
@@ -220,9 +234,8 @@ class ActionDecoder(nn.Module):
         x = self.reduction_layers(x)  # Shape: (batch_size, final_output_dim)
         
         return x
-
-
-
+# 9. Numeric Feature Adaptor
+# The NumericFeatureAdaptor class adapts numeric input features into the internal dimensionality.
 class NumericFeatureAdaptor(nn.Module):
     def __init__(self, input_size, output_size):
         super(NumericFeatureAdaptor, self).__init__()
@@ -230,38 +243,67 @@ class NumericFeatureAdaptor(nn.Module):
 
     def forward(self, x):
         return F.relu(self.fc(x))
+# 10. Attention Module
+# The AttentionModule class applies an attention mechanism to combine multilpe sources of embeddings into 1
+class AttentionModule(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(AttentionModule, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
 
+    def forward(self, query_input, key_value_inputs):
+        # Prepare for attention mechanism
+        key_value_tensor = torch.stack(key_value_inputs)  # Shape: (num_sources, batch_size, internal_dim)
+        key_value_tensor = key_value_tensor.permute(1, 0, 2)  # Shape: (batch_size, num_sources, internal_dim)
+        
+        # Query input
+        query = query_input.unsqueeze(1)  # Shape: (batch_size, 1, internal_dim)
+        
 
+        print(key_value_tensor.shape, query.shape)
+        # Apply attention with query input, and key_value_inputs as key and value
+        attn_output, _ = self.attention(query, key_value_tensor, key_value_tensor)
+        
+        # Remove the singleton dimension from the output
+        attn_output = attn_output.squeeze(1)  # Shape: (batch_size, internal_dim)
 
+        return attn_output
+
+# 11. Brain
+# The Brain class integrates all the components to simulate a neural network inspired by the human brain, combining vision processing,
+# numeric feature adaptation, memory networks, and attention mechanisms.
 class Brain(nn.Module):
-    def __init__(self, internal_dim, final_output_dim, sub_network_dim, num_layers, dopamine_hidden_size):
+    def __init__(self, img_width, img_height, internal_dim, final_output_dim, sub_network_dim, num_layers, dopamine_hidden_size, num_sub_networks, num_memory_networks):
         super(Brain, self).__init__()
         
         self.internal_dim = internal_dim
         self.final_output_dim = final_output_dim
         
         # Vision encoders
-        self.vision_encoder_1 = VisionEncoder()
-        self.vision_encoder_2 = VisionEncoder()
-        self.vision_encoder_3 = VisionEncoder()
+        self.vision_encoder_1 = VisionEncoder(img_width, img_height)
+        self.vision_encoder_2 = VisionEncoder(img_width, img_height)
+        self.vision_encoder_3 = VisionEncoder(img_width, img_height)
         
         # Numeric feature adaptor
         self.numeric_feature_adaptor = NumericFeatureAdaptor(input_size=3, output_size=internal_dim)
         
-        # Neural memory network
-        self.neural_memory = NeuralMemoryNetwork(input_size=internal_dim, 
-                                                 hidden_size=sub_network_dim, 
-                                                 output_size=internal_dim, 
-                                                 num_subnetworks=internal_dim // sub_network_dim, 
-                                                 num_layers=num_layers, 
-                                                 dopamine_hidden_size=dopamine_hidden_size)
+        # Neural memory networks
+        self.neural_memory_networks = nn.ModuleList([
+            NeuralMemoryNetwork(
+                input_size=internal_dim, 
+                hidden_size=sub_network_dim, 
+                output_size=internal_dim, 
+                num_subnetworks=num_sub_networks, 
+                num_layers=num_layers, 
+                dopamine_hidden_size=dopamine_hidden_size
+            ) for _ in range(num_memory_networks)
+        ])
+        
+        # Attention mechanism
+        self.attention = AttentionModule(embed_dim=internal_dim, num_heads=8)
         
         # Action decoder
         self.action_decoder = ActionDecoder(internal_dim=internal_dim, final_output_dim=final_output_dim)
         
-        # Initialize previous states for the neural memory network
-        self.prev_states = [torch.zeros(1, sub_network_dim) for _ in range(internal_dim // sub_network_dim)]
-
     def forward(self, image_1, image_2, image_3, accel_data, fovea_coords):
         fovea_x1, fovea_y1, fovea_x2, fovea_y2, fovea_x3, fovea_y3 = fovea_coords
         
@@ -273,22 +315,27 @@ class Brain(nn.Module):
         # Process accelerometer data through the numeric feature adaptor
         accel_output = self.numeric_feature_adaptor(accel_data)
         
-        # Combine encodings using max pooling
-        combined_encoding = torch.max(torch.stack([fovea_output_1, peripheral_output_1, 
-                                                   fovea_output_2, peripheral_output_2, 
-                                                   fovea_output_3, peripheral_output_3, 
-                                                   accel_output]), dim=0)[0]
+        # Combine encodings of images and numeric input using attention
+        image_encodings = [fovea_output_1, fovea_output_2, fovea_output_3, peripheral_output_1, peripheral_output_2, peripheral_output_3]
+        combined_encoding = self.attention(accel_output, image_encodings).squeeze(1)
+
+        print("here", combined_encoding.shape)
+
+        # Pass combined encoding through each neural memory network
+        final_outputs_of_all_memory_networks = []
+        for neural_memory_network in self.neural_memory_networks:
+            memory_output = neural_memory_network(combined_encoding.unsqueeze(0))
+            final_outputs_of_all_memory_networks.append(memory_output)
         
-        # Pass combined encoding through the neural memory network
-        memory_output, new_states, all_hidden_states, combined_activations = self.neural_memory(combined_encoding.unsqueeze(0), self.prev_states)
+        # Apply attention mechanism on combined activations from memory networks
+        attn_output = self.attention(combined_encoding, final_outputs_of_all_memory_networks)
         
-        # Update previous states for the next forward pass
-        self.prev_states = new_states
-        
-        # Add skip connection from the combined encoding to the memory output
-        combined_output = combined_encoding + memory_output.squeeze(0)
-        
-        # Pass the output of the neural memory network through the action decoder
-        final_output = self.action_decoder(combined_output)
+        # Pass the output of the attention mechanism through the action decoder
+        final_output = self.action_decoder(attn_output)
         
         return final_output
+
+    def hebbian_update(self, current_loss, final_output):
+        for neural_memory_network in self.neural_memory_networks:
+            neural_memory_network.hebbian_update(current_loss, final_output)
+
