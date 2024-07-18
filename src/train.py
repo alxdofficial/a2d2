@@ -5,13 +5,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from dataset import DriveDataset
 from model import Brain
+from visualizememory import visualize_memory
+from tqdm import tqdm
 
 # Hyperparameters
 EPOCHS = 50
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 BATCH_SIZE = 1  # As specified, batch size is always 1
 INTERNAL_DIM = 4096
-FINAL_OUTPUT_DIM = 3  # Predicting 3 values: accelerator_pedal, brake_pressure, steering_angle_calculated
+FINAL_OUTPUT_DIM = 9  # Adjusted to 9 to include the 6 fovea coordinates
 NUM_SUB_NETWORKS = 8
 NUM_LAYERS = 5
 NUM_MEMORY_NETWORKS = 24
@@ -36,7 +38,7 @@ model = Brain(
     img_width=IMAGE_WIDTH,
     img_height=IMAGE_HEIGHT,
     internal_dim=INTERNAL_DIM,
-    final_output_dim=FINAL_OUTPUT_DIM,
+    final_output_dim=FINAL_OUTPUT_DIM,  # Now 9 values
     sub_network_dim=sub_network_dim,
     num_layers=NUM_LAYERS,
     dopamine_hidden_size=DOPAMINE_HIDDEN_SIZE,
@@ -50,39 +52,60 @@ optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 # Training Loop
 for epoch in range(EPOCHS):
     epoch_loss = 0
-    for i, (images, input_data, labels) in enumerate(dataloader):
-        # Move inputs to GPU
-        image_1, image_2, image_3 = [img.to(device) for img in images]
-        input_data = input_data.to(device)
-        labels = labels.to(device)
-
+    with tqdm(total=len(dataloader), desc=f'Epoch {epoch+1}/{EPOCHS}') as pbar:
         # Initialize fovea_coords to be the center of the image
         fovea_coords = [
             IMAGE_WIDTH // 2, IMAGE_HEIGHT // 2,
             IMAGE_WIDTH // 2, IMAGE_HEIGHT // 2,
             IMAGE_WIDTH // 2, IMAGE_HEIGHT // 2
         ]
+        for i, (images, input_data, labels) in enumerate(dataloader):
+            # Move inputs to GPU
+            image_1, image_2, image_3 = [img.to(device) for img in images]
+            input_data = input_data.to(device)
+            labels = labels.to(device)
 
-        # Forward pass
-        outputs = model(image_1, image_2, image_3, input_data, fovea_coords)
+            # Forward pass
+            outputs = model(image_1, image_2, image_3, input_data, fovea_coords)
 
-        # Compute loss
-        loss = criterion(outputs, labels)
+            # Separate the first 3 values for loss calculation and the latter 6 values as new fovea coordinates
+            predictions = outputs[:, :3]
+            fovea_coords_pred = outputs[:, 3:]
 
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Compute loss using the first 3 values
+            loss = criterion(predictions, labels)
 
-        # Accumulate loss
-        epoch_loss += loss.item()
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-        # Update Hebbian weights
-        model.hebbian_update(loss.item(), outputs)
+            # Accumulate loss
+            epoch_loss += loss.item()
 
-        if (i + 1) % 100 == 0:
-            print(f'Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
-    
+            # Update Hebbian weights
+            model.hebbian_update(loss.item())
+
+            # Update fovea coordinates for the next step (convert from percentage to pixel values and clip)
+            new_fovea_coords = []
+            for j in range(fovea_coords_pred.size(1)):
+                if j % 2 == 0:  # x-coordinate
+                    coord = (fovea_coords_pred[:, j] * IMAGE_WIDTH).int().clamp(0, IMAGE_WIDTH - 1)
+                else:  # y-coordinate
+                    coord = (fovea_coords_pred[:, j] * IMAGE_HEIGHT).int().clamp(0, IMAGE_HEIGHT - 1)
+                new_fovea_coords.append(coord.item())
+
+            fovea_coords = new_fovea_coords
+
+            # Visualize memory networks every 100 steps
+            # if (i + 1) % 100 == 0:
+            visualize_memory(model, frame_number=i + 1)
+
+            pbar.set_postfix({'Loss': loss.item()})
+            pbar.update(1)
+
     print(f'Epoch [{epoch+1}/{EPOCHS}], Loss: {epoch_loss / len(dataloader):.4f}')
 
 # Save the model checkpoint

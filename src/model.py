@@ -39,6 +39,7 @@ class FullyConnected(nn.Module):
             layers.append(nn.Linear(current_dim, hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
+            layers.append(nn.LayerNorm(hidden_dim))
             current_dim = hidden_dim
         layers.append(nn.Linear(current_dim, output_dim))
         self.fc = nn.Sequential(*layers)
@@ -98,12 +99,17 @@ class HebbianLayer(nn.Module):
         self.decay = decay  # Decay parameter
         self.prev_state = None
         self.prev_input = None
+        self.layer_norm = nn.LayerNorm(output_size)  # Layer normalization for the activations
 
     def forward(self, x):
         if self.prev_state is None:
             self.prev_state = torch.zeros(x.size(0), self.weight.size(0), device=x.device)
-        combined_input = x + torch.mm(self.prev_state.detach(), self.recurrent_weight.detach())
+
+        prev_state_detached = self.prev_state.detach()
+        combined_input = x + torch.mm(prev_state_detached, self.recurrent_weight.detach())
         activations = F.relu(torch.mm(combined_input, self.weight.detach().t()))
+        activations = self.layer_norm(activations)  # Apply layer normalization
+
         self.prev_input = x
         self.prev_state = activations
         return activations
@@ -152,9 +158,12 @@ class DopamineNetwork(nn.Module):
         self.fc2 = nn.Linear(hidden_size, num_subnetworks * num_layers)
         self.num_layers = num_layers
 
-    def forward(self, prev_loss, current_loss, activations):
-        loss_diff = prev_loss - current_loss
-        x = torch.cat([loss_diff.unsqueeze(0), activations.flatten().unsqueeze(0)], dim=-1)
+    def forward(self, loss_diff, activations):
+        # Ensure loss_diff is a tensor and reshape it
+        if isinstance(loss_diff, float):
+            loss_diff = torch.tensor([loss_diff], dtype=torch.float32, device=activations.device)
+        loss_diff = loss_diff.unsqueeze(0)  # Shape: (1,)
+        x = torch.cat([loss_diff, activations.flatten().unsqueeze(0)], dim=-1)  # Concatenate along the feature dimension
         x = F.relu(self.fc1(x))
         dopamine_signals = torch.tanh(self.fc2(x))  # Output in range [-1, 1]
         return dopamine_signals.view(-1, self.num_layers)  # Shape: (num_subnetworks, num_layers)
@@ -170,31 +179,43 @@ class NeuralMemoryNetwork(nn.Module):
         for _ in range(num_subnetworks):
             self.subnetworks.append(SubNetwork(hidden_size, hidden_size, num_layers))
 
-        self.output_layer = nn.Linear(hidden_size * num_subnetworks, output_size)
-        self.dopamine_network = DopamineNetwork(hidden_size * num_subnetworks + 1, dopamine_hidden_size, num_subnetworks, num_layers)
+        self.output_layer = nn.Linear(INTERNAL_DIM, output_size)
+        self.dopamine_network = DopamineNetwork(INTERNAL_DIM + 1, dopamine_hidden_size, num_subnetworks, num_layers)
+        self.layer_norm = nn.LayerNorm(output_size)  # Apply layer normalization
+
         self.prev_loss = None
+        self.activations = None
 
     def forward(self, x):
         x_splits = x.split(self.hidden_size, dim=-1)
         activations_of_all_subnetworks = []
         for i, subnetwork in enumerate(self.subnetworks):
-            activations_of_all_subnetworks.append(subnetwork(x_splits[i]))
+            activations_of_all_subnetworks.append(subnetwork(x_splits[i].squeeze(0)))
 
         # Combine final activations for the final output
         combined_activations = torch.cat(activations_of_all_subnetworks, dim=-1)
-
+        
         # Use combined activations to generate the final output
         final_output = self.output_layer(combined_activations)
+        final_output = self.layer_norm(final_output)
+        self.activations = final_output
         return final_output
 
-    def hebbian_update(self, current_loss, final_output):
+    def hebbian_update(self, current_loss):
         if self.prev_loss is None:
             self.prev_loss = current_loss
 
-        dopamine_signals = self.dopamine_network(self.prev_loss, current_loss, final_output)
+        # Compute the loss difference as a tensor
+        loss_diff = torch.tensor(self.prev_loss - current_loss, dtype=torch.float32, device=self.activations.device).unsqueeze(0)
 
-        for subnetwork in self.subnetworks:
-            subnetwork.hebbian_update(dopamine_signals)
+        # Get activations
+        activations = self.activations.detach()
+
+        # Compute dopamine signals
+        dopamine_signals = self.dopamine_network(loss_diff, activations)
+        # print("in NMN hebbbian update, dopamine_signals shape: ", dopamine_signals.shape)
+        for i, subnetwork in enumerate(self.subnetworks):
+            subnetwork.hebbian_update(dopamine_signals[i, :])
 
         self.prev_loss = current_loss
 # 8. Action Decoder
@@ -206,22 +227,29 @@ class ActionDecoder(nn.Module):
         # Intermediate layers to create abstract action intent
         self.abstract_layers = nn.Sequential(
             nn.Linear(internal_dim, internal_dim),
+            nn.LayerNorm(internal_dim),
             nn.ReLU(),
             nn.Linear(internal_dim, internal_dim),
+            nn.LayerNorm(internal_dim),
             nn.ReLU(),
             nn.Linear(internal_dim, internal_dim),
+            nn.LayerNorm(internal_dim),
             nn.ReLU()
         )
         
         # Gradually reducing layers to produce final output
         self.reduction_layers = nn.Sequential(
             nn.Linear(internal_dim, internal_dim // 2),
+            nn.LayerNorm(internal_dim // 2),
             nn.ReLU(),
             nn.Linear(internal_dim // 2, internal_dim // 4),
+            nn.LayerNorm(internal_dim // 4),
             nn.ReLU(),
             nn.Linear(internal_dim // 4, internal_dim // 8),
+            nn.LayerNorm(internal_dim // 8),
             nn.ReLU(),
             nn.Linear(internal_dim // 8, internal_dim // 16),
+            nn.LayerNorm(internal_dim // 16),
             nn.ReLU(),
             nn.Linear(internal_dim // 16, final_output_dim)
         )
@@ -253,13 +281,11 @@ class AttentionModule(nn.Module):
     def forward(self, query_input, key_value_inputs):
         # Prepare for attention mechanism
         key_value_tensor = torch.stack(key_value_inputs)  # Shape: (num_sources, batch_size, internal_dim)
-        key_value_tensor = key_value_tensor.permute(1, 0, 2)  # Shape: (batch_size, num_sources, internal_dim)
-        
         # Query input
-        query = query_input.unsqueeze(1)  # Shape: (batch_size, 1, internal_dim)
+        query = query_input.unsqueeze(1)  # Shape: (1, batch_size, internal_dim)
         
 
-        print(key_value_tensor.shape, query.shape)
+        # print(key_value_tensor.shape, query.shape)
         # Apply attention with query input, and key_value_inputs as key and value
         attn_output, _ = self.attention(query, key_value_tensor, key_value_tensor)
         
@@ -319,8 +345,6 @@ class Brain(nn.Module):
         image_encodings = [fovea_output_1, fovea_output_2, fovea_output_3, peripheral_output_1, peripheral_output_2, peripheral_output_3]
         combined_encoding = self.attention(accel_output, image_encodings).squeeze(1)
 
-        print("here", combined_encoding.shape)
-
         # Pass combined encoding through each neural memory network
         final_outputs_of_all_memory_networks = []
         for neural_memory_network in self.neural_memory_networks:
@@ -329,13 +353,11 @@ class Brain(nn.Module):
         
         # Apply attention mechanism on combined activations from memory networks
         attn_output = self.attention(combined_encoding, final_outputs_of_all_memory_networks)
-        
         # Pass the output of the attention mechanism through the action decoder
         final_output = self.action_decoder(attn_output)
-        
         return final_output
 
-    def hebbian_update(self, current_loss, final_output):
+    def hebbian_update(self, current_loss):
         for neural_memory_network in self.neural_memory_networks:
-            neural_memory_network.hebbian_update(current_loss, final_output)
+            neural_memory_network.hebbian_update(current_loss)
 
