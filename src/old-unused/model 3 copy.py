@@ -385,16 +385,11 @@ class Brain(nn.Module):
         combined_encoding = self.attention(accel_output, image_encodings).squeeze(1).detach()
         self.combined_sensory_encoding = combined_encoding  # save combined_sensory_encoding for emotional module in hebbian update
 
-        # Use CUDA streams to parallelize NeuralMemoryNetwork execution
-        streams = [torch.cuda.Stream() for _ in range(len(self.neural_memory_networks))]
+        # Pass combined encoding through each neural memory network
         final_outputs_of_all_memory_networks = []
-
-        for i, (neural_memory_network, stream) in enumerate(zip(self.neural_memory_networks, streams)):
-            with torch.cuda.stream(stream):
-                memory_output = neural_memory_network(combined_encoding.unsqueeze(0).to('cuda'))
-                final_outputs_of_all_memory_networks.append(memory_output)
-
-        torch.cuda.synchronize()  # Ensure all streams are finished
+        for neural_memory_network in self.neural_memory_networks:
+            memory_output = neural_memory_network(combined_encoding.unsqueeze(0))
+            final_outputs_of_all_memory_networks.append(memory_output)
 
         # Apply attention mechanism on combined activations from memory networks
         attn_output = self.attention(combined_encoding, final_outputs_of_all_memory_networks).detach()

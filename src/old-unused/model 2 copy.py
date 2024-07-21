@@ -89,7 +89,7 @@ class VisionEncoder(nn.Module):
         return fovea_output, peripheral_output 
 
 # 4. Hebbian Layer
-# The HebbianLayer class defines a layer with Hebbian learning, where weights are updated based on the activity of neurons and the presence of a neuro modulators.    
+# The HebbianLayer class defines a layer with Hebbian learning, where weights are updated based on the activity of neurons and the presence of a dopamine signal.    
 class HebbianLayer(nn.Module):
     def __init__(self, input_size, output_size, scaling, decay):
         super(HebbianLayer, self).__init__()
@@ -102,68 +102,38 @@ class HebbianLayer(nn.Module):
         self.layer_norm = nn.LayerNorm(output_size)  # Layer normalization for the activations
         self.max_magnitude = 3
 
-        # Neurotransmitter signals
-        self.dopamine_signal = 0.0
-        self.serotonin_signal = 0.0
-        self.gaba_signal = 0.0
-        self.glutamate_signal = 0.0
-
     def forward(self, x):
         if self.prev_state is None:
             self.prev_state = torch.zeros(x.size(0), self.weight.size(0), device=x.device)
 
         prev_state_detached = self.prev_state.detach()
         combined_input = x + torch.mm(prev_state_detached, self.recurrent_weight.detach())
-        
-        activations = torch.mm(combined_input, self.weight.detach().t())
-        activations = self.layer_norm(activations)  # Apply layer normalization
-
-        # Apply GABA and glutamate modulation
-        threshold = torch.mean(activations)  # Base threshold
-        threshold += self.gaba_signal  # Increase threshold with GABA
-        threshold -= self.glutamate_signal  # Decrease threshold with glutamate
-        activations = torch.relu(activations - threshold)  # Apply threshold and ReLU
+        activations = F.relu(torch.mm(combined_input, self.weight.detach().t()))
         activations = self.layer_norm(activations)  # Apply layer normalization
 
         self.prev_input = x
         self.prev_state = activations
-
-        self.hebbian_update()
         return activations
 
-    def hebbian_update(self):
+    def hebbian_update(self, dopamine_signal):
         with torch.no_grad():
             # Hebbian update for input weights
             hebbian_term_input = torch.mm(self.prev_state.t(), self.prev_input)
-            weight_update = self.alpha * self.dopamine_signal * hebbian_term_input
-            self.weight.data += weight_update
+            self.weight += self.alpha * dopamine_signal * hebbian_term_input
 
             # Hebbian update for recurrent weights
             hebbian_term_recurrent = torch.mm(self.prev_state.t(), self.prev_state)
-            recurrent_weight_update = self.alpha * self.dopamine_signal * hebbian_term_recurrent
-            self.recurrent_weight.data += recurrent_weight_update
+            self.recurrent_weight += self.alpha * dopamine_signal * hebbian_term_recurrent
 
             # Apply decay to all input weights
-            self.weight.data -= self.decay * self.weight.data
+            self.weight -= self.decay * self.weight
 
             # Apply decay to all recurrent weights
-            self.recurrent_weight.data -= self.decay * self.recurrent_weight.data
+            self.recurrent_weight -= self.decay * self.recurrent_weight
 
             # Normalize weights to have range -3 to 3
             self.weight.data = nn.functional.normalize(self.weight.data, p=2, dim=1) * self.max_magnitude
             self.recurrent_weight.data = nn.functional.normalize(self.recurrent_weight.data, p=2, dim=1) * self.max_magnitude
-
-    def update_neuro_modulators(self, dopamine, serotonin, gaba, glutamate):
-        # Update dopamine with serotonin modulation
-        change_in_dopamine = dopamine - self.dopamine_signal
-        self.dopamine_signal += change_in_dopamine * (1 - serotonin)
-
-        # Update other neurotransmitters
-        self.serotonin_signal = serotonin
-        self.gaba_signal = gaba
-        self.glutamate_signal = glutamate
-
-
 # 5. SubNetwork
 # The SubNetwork class stacks multiple HebbianLayers to create a more complex subnetwork.
 class SubNetwork(nn.Module):
@@ -181,47 +151,38 @@ class SubNetwork(nn.Module):
             x = layer(x)
         return x
 
-    def update_neuro_modulators(self, neurotransmitter_signals):
+    def hebbian_update(self, dopamine_signals):
         for i, layer in enumerate(self.layers):
-            dopamine_signal = neurotransmitter_signals[i, 0]
-            serotonin_signal = neurotransmitter_signals[i, 1]
-            gaba_signal = neurotransmitter_signals[i, 2]
-            glutamate_signal = neurotransmitter_signals[i, 3]
-
-            layer.update_neuro_modulators(dopamine_signal, serotonin_signal, gaba_signal, glutamate_signal)
-
-
-# 6. EmotionalModule
-# The EmotionalModule class generates dopamine,serotonin,gaba,etc signals based on the sensort input and the activations from the networks.
-class EmotionalModule(nn.Module):
-    def __init__(self, input_size, hidden_size, num_subnetworks, num_layers, num_neurotransmitters):
-        super(EmotionalModule, self).__init__()
+            layer.hebbian_update(dopamine_signals[i])
+# 6. Dopamine Network
+# The DopamineNetwork class generates dopamine signals based on the difference between previous and current losses and the activations from the networks.
+class DopamineNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, num_subnetworks, num_layers):
+        super(DopamineNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, num_subnetworks * num_layers * num_neurotransmitters)
+        self.fc2 = nn.Linear(hidden_size, num_subnetworks * num_layers)
         self.num_layers = num_layers
-        self.num_neurotransmitters = num_neurotransmitters
 
     def forward(self, combined_sensory_encoding, activations):
+
         x = torch.cat([combined_sensory_encoding, activations.flatten().unsqueeze(0)], dim=-1)  # Concatenate along the feature dimension
         x = F.relu(self.fc1(x))
-        neurotransmitter_signals = torch.tanh(self.fc2(x))  # Output in range [-1, 1]
-        return neurotransmitter_signals.view(-1, self.num_layers, self.num_neurotransmitters)  # Shape: (num_subnetworks, num_layers, num_neurotransmitters)
-
+        dopamine_signals = torch.tanh(self.fc2(x))  # Output in range [-1, 1]
+        return dopamine_signals.view(-1, self.num_layers)  # Shape: (num_subnetworks, num_layers)
 # 7. Neural Memory Network
-# The NeuralMemoryNetwork class combines multiple subnetworks and an emotional module to form a memory network that can update its weights based on neurotransmitter signals.    
+# The NeuralMemoryNetwork class combines multiple subnetworks and a dopamine network to form a memory network that can update its weights based on a dopamine signal.    
 class NeuralMemoryNetwork(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_subnetworks, num_layers, emotional_hidden_size, num_neurotransmitters):
+    def __init__(self, input_size, hidden_size, output_size, num_subnetworks, num_layers, dopamine_hidden_size):
         super(NeuralMemoryNetwork, self).__init__()
         self.subnetworks = nn.ModuleList()
         self.hidden_size = hidden_size
         self.num_subnetworks = num_subnetworks
         self.num_layers = num_layers
-        self.num_neurotransmitters = num_neurotransmitters
         for _ in range(num_subnetworks):
             self.subnetworks.append(SubNetwork(hidden_size, hidden_size, num_layers))
 
         self.output_layer = nn.Linear(INTERNAL_DIM, output_size)
-        self.emotional_module = EmotionalModule(INTERNAL_DIM + INTERNAL_DIM, emotional_hidden_size, num_subnetworks, num_layers, num_neurotransmitters)
+        self.dopamine_network = DopamineNetwork(INTERNAL_DIM + INTERNAL_DIM, dopamine_hidden_size, num_subnetworks, num_layers)
         self.layer_norm = nn.LayerNorm(output_size)  # Apply layer normalization
 
         self.prev_loss = None
@@ -242,17 +203,16 @@ class NeuralMemoryNetwork(nn.Module):
         self.activations = final_output
         return final_output
 
-    def update_neuro_modulators(self, combined_sensory_encoding):
+    def hebbian_update(self, combined_sensory_encoding):
+
         # Get activations
         activations = self.activations.detach()
 
-        # Compute neurotransmitter signals
-        neurotransmitter_signals = self.emotional_module(combined_sensory_encoding, activations)
-
-        # Iterate through each subnetwork and update neurotransmitters
+        # Compute dopamine signals
+        dopamine_signals = self.dopamine_network(combined_sensory_encoding, activations)
+        # print("in NMN hebbbian update, dopamine_signals shape: ", dopamine_signals.shape)
         for i, subnetwork in enumerate(self.subnetworks):
-            subnetwork.update_neuro_modulators(neurotransmitter_signals[i])
-
+            subnetwork.hebbian_update(dopamine_signals[i, :])
 
 # 8. Action Decoder
 # The ActionDecoder class reduces the internal representation to the final output using a series of fully connected layers.
@@ -334,74 +294,68 @@ class AttentionModule(nn.Module):
 # The Brain class integrates all the components to simulate a neural network inspired by the human brain, combining vision processing,
 # numeric feature adaptation, memory networks, and attention mechanisms.
 class Brain(nn.Module):
-    def __init__(self, img_width, img_height, internal_dim, final_output_dim, sub_network_dim, num_layers, emotional_hidden_size, num_sub_networks, num_memory_networks, num_neurotransmitters):
+    def __init__(self, img_width, img_height, internal_dim, final_output_dim, sub_network_dim, num_layers, dopamine_hidden_size, num_sub_networks, num_memory_networks):
         super(Brain, self).__init__()
-
+        
         self.internal_dim = internal_dim
         self.final_output_dim = final_output_dim
-
+        
         # Vision encoders
         self.vision_encoder_1 = VisionEncoder(img_width, img_height)
         self.vision_encoder_2 = VisionEncoder(img_width, img_height)
         self.vision_encoder_3 = VisionEncoder(img_width, img_height)
-
+        
         # Numeric feature adaptor
         self.numeric_feature_adaptor = NumericFeatureAdaptor(input_size=3, output_size=internal_dim)
-
+        
         # Neural memory networks
         self.neural_memory_networks = nn.ModuleList([
             NeuralMemoryNetwork(
-                input_size=internal_dim,
-                hidden_size=sub_network_dim,
-                output_size=internal_dim,
-                num_subnetworks=num_sub_networks,
-                num_layers=num_layers,
-                emotional_hidden_size=emotional_hidden_size,
-                num_neurotransmitters=num_neurotransmitters
+                input_size=internal_dim, 
+                hidden_size=sub_network_dim, 
+                output_size=internal_dim, 
+                num_subnetworks=num_sub_networks, 
+                num_layers=num_layers, 
+                dopamine_hidden_size=dopamine_hidden_size
             ) for _ in range(num_memory_networks)
         ])
-
+        
         # Attention mechanism
         self.attention = AttentionModule(embed_dim=internal_dim, num_heads=8)
-
+        
         # Action decoder
         self.action_decoder = ActionDecoder(internal_dim=internal_dim, final_output_dim=final_output_dim)
 
         self.combined_sensory_encoding = None
-
+        
     def forward(self, image_1, image_2, image_3, accel_data, fovea_coords):
         fovea_x1, fovea_y1, fovea_x2, fovea_y2, fovea_x3, fovea_y3 = fovea_coords
-
+        
         # Process images through their respective vision encoders
         fovea_output_1, peripheral_output_1 = self.vision_encoder_1(image_1, fovea_x1, fovea_y1)
         fovea_output_2, peripheral_output_2 = self.vision_encoder_2(image_2, fovea_x2, fovea_y2)
         fovea_output_3, peripheral_output_3 = self.vision_encoder_3(image_3, fovea_x3, fovea_y3)
-
+        
         # Process accelerometer data through the numeric feature adaptor
         accel_output = self.numeric_feature_adaptor(accel_data)
-
+        
         # Combine encodings of images and numeric input using attention
         image_encodings = [fovea_output_1, fovea_output_2, fovea_output_3, peripheral_output_1, peripheral_output_2, peripheral_output_3]
-        combined_encoding = self.attention(accel_output, image_encodings).squeeze(1).detach()
-        self.combined_sensory_encoding = combined_encoding  # save combined_sensory_encoding for emotional module in hebbian update
-
-        # Use CUDA streams to parallelize NeuralMemoryNetwork execution
-        streams = [torch.cuda.Stream() for _ in range(len(self.neural_memory_networks))]
+        combined_encoding = self.attention(accel_output, image_encodings).squeeze(1)
+        self.combined_sensory_encoding = combined_encoding # save combined_sensory_encoding for dopamine network in hebbian update
+        # Pass combined encoding through each neural memory network
         final_outputs_of_all_memory_networks = []
-
-        for i, (neural_memory_network, stream) in enumerate(zip(self.neural_memory_networks, streams)):
-            with torch.cuda.stream(stream):
-                memory_output = neural_memory_network(combined_encoding.unsqueeze(0).to('cuda'))
-                final_outputs_of_all_memory_networks.append(memory_output)
-
-        torch.cuda.synchronize()  # Ensure all streams are finished
-
+        for neural_memory_network in self.neural_memory_networks:
+            memory_output = neural_memory_network(combined_encoding.unsqueeze(0))
+            final_outputs_of_all_memory_networks.append(memory_output)
+        
         # Apply attention mechanism on combined activations from memory networks
-        attn_output = self.attention(combined_encoding, final_outputs_of_all_memory_networks).detach()
+        attn_output = self.attention(combined_encoding, final_outputs_of_all_memory_networks)
         # Pass the output of the attention mechanism through the action decoder
         final_output = self.action_decoder(attn_output)
         return final_output
 
-    def update_neuro_modulators(self):
+    def hebbian_update(self):
         for neural_memory_network in self.neural_memory_networks:
-            neural_memory_network.update_neuro_modulators(self.combined_sensory_encoding.detach())
+            neural_memory_network.hebbian_update(self.combined_sensory_encoding)
+
